@@ -1,9 +1,6 @@
-# Runtime dumps from the local proxy
-*.log
-last-muse-request.json
-last-muse-tools.json
-last-muse-tools-full.json
-last-upstream-error.json
+# Runtime dumps and logs
+/var/*
+!/var/.gitkeep
 
 # Python
 __pycache__/

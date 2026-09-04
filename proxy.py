@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Codex → Vercel proxy that makes non-OpenAI models work in Codex Desktop.
+"""Local Codex → AI Gateway proxy that makes non-OpenAI models work in Codex Desktop.
 
 Request side (rewrite.py): strict-schema fixes for Muse Spark, namespace
 flattening for every non-OpenAI model. Response side (stream.py): restores
@@ -27,10 +27,11 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18787
 DEFAULT_UPSTREAM = "https://ai-gateway.vercel.sh"
 HERE = os.path.dirname(os.path.abspath(__file__))
-LAST_TOOLS_PATH = os.path.join(HERE, "last-muse-tools.json")
-LAST_TOOLS_FULL_PATH = os.path.join(HERE, "last-muse-tools-full.json")
-LAST_ERROR_PATH = os.path.join(HERE, "last-upstream-error.json")
-LAST_REQUEST_PATH = os.path.join(HERE, "last-muse-request.json")
+VAR_DIR = os.path.join(HERE, "var")
+LAST_TOOLS_PATH = os.path.join(VAR_DIR, "last-tools.json")
+LAST_TOOLS_FULL_PATH = os.path.join(VAR_DIR, "last-tools-full.json")
+LAST_ERROR_PATH = os.path.join(VAR_DIR, "last-upstream-error.json")
+LAST_REQUEST_PATH = os.path.join(VAR_DIR, "last-request.json")
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -44,7 +45,7 @@ HOP_BY_HOP = {
 }
 OVERRIDDEN_HEADERS = {"content-length", "accept-encoding"}
 
-log = logging.getLogger("muse-schema-proxy")
+log = logging.getLogger("codex-gateway-compat")
 
 
 def split_upstream(url: str) -> Tuple[str, str, int, bool]:
@@ -99,7 +100,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         payload = json.dumps(
             {
                 "ok": True,
-                "service": "muse-schema-proxy",
+                "service": "codex-gateway-compat",
                 "upstream": self.server.upstream_url,
             }
         ).encode("utf-8")
@@ -328,22 +329,23 @@ class ProxyServer(ThreadingHTTPServer):
 
     def __init__(self, host: str, port: int, upstream_url: str, capture_debug: bool = True):
         self.upstream_url = upstream_url.rstrip("/")
-        # Writes last-muse-*.json next to this file for troubleshooting.
+        # Writes last-*.json under var/ for troubleshooting.
         self.capture_debug = capture_debug
+        os.makedirs(VAR_DIR, exist_ok=True)
         super().__init__((host, port), ProxyHandler)
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default=os.environ.get("MUSE_SCHEMA_PROXY_HOST", DEFAULT_HOST))
+    parser.add_argument("--host", default=os.environ.get("CODEX_GATEWAY_COMPAT_HOST", DEFAULT_HOST))
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("MUSE_SCHEMA_PROXY_PORT", DEFAULT_PORT)),
+        default=int(os.environ.get("CODEX_GATEWAY_COMPAT_PORT", DEFAULT_PORT)),
     )
     parser.add_argument(
         "--upstream",
-        default=os.environ.get("MUSE_SCHEMA_PROXY_UPSTREAM", DEFAULT_UPSTREAM),
+        default=os.environ.get("CODEX_GATEWAY_COMPAT_UPSTREAM", DEFAULT_UPSTREAM),
     )
     return parser.parse_args(argv)
 
