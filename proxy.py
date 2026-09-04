@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Local Codex → Vercel proxy that repairs strict tool schemas for Muse Spark."""
+"""Local Codex → Vercel proxy that makes non-OpenAI models work in Codex Desktop.
+
+Request side (rewrite.py): strict-schema fixes for Muse Spark, namespace
+flattening for every non-OpenAI model. Response side (stream.py): restores
+namespaced tool calls and coerces integral floats in tool arguments.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,8 @@ from typing import List, Optional, Tuple
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rewrite import rewrite_request_bytes, summarize_models, summarize_tools
+from rewrite import RequestContext, rewrite_request_bytes, summarize_models, summarize_tools
+from stream import SSERewriter, rewrite_json_response
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18787
@@ -24,6 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LAST_TOOLS_PATH = os.path.join(HERE, "last-muse-tools.json")
 LAST_TOOLS_FULL_PATH = os.path.join(HERE, "last-muse-tools-full.json")
 LAST_ERROR_PATH = os.path.join(HERE, "last-upstream-error.json")
+LAST_REQUEST_PATH = os.path.join(HERE, "last-muse-request.json")
 HOP_BY_HOP = {
     "connection",
     "keep-alive",
@@ -35,6 +42,7 @@ HOP_BY_HOP = {
     "upgrade",
     "host",
 }
+OVERRIDDEN_HEADERS = {"content-length", "accept-encoding"}
 
 log = logging.getLogger("muse-schema-proxy")
 
@@ -110,6 +118,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         body = self._read_body()
         patched = 0
+        ctx: Optional[RequestContext] = None
         path = self.path.split("?", 1)[0]
         if self.command == "POST" and path.rstrip("/").endswith("responses") and body:
             try:
@@ -117,9 +126,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 model = summarize_models(parsed)
             except ValueError:
                 model = ""
-            body, patched = rewrite_request_bytes(body)
+            body, patched, ctx = rewrite_request_bytes(body)
             if patched:
-                log.info("rewrote %s schema object(s) for model %s", patched, model or "?")
+                log.info(
+                    "rewrote %s object(s) for model %s (flatten=%s, %s namespaced tools)",
+                    patched,
+                    model or "?",
+                    ctx.flatten,
+                    len(ctx.mapping),
+                )
+            if patched and self.server.capture_debug:
                 try:
                     parsed_after = json.loads(body)
                     summary = summarize_tools(parsed_after)
@@ -136,34 +152,52 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         )
                     with open(LAST_TOOLS_FULL_PATH, "w", encoding="utf-8") as handle:
                         json.dump(parsed_after.get("tools"), handle)
+                    with open(LAST_REQUEST_PATH, "w", encoding="utf-8") as handle:
+                        json.dump(
+                            {
+                                "path": self.path,
+                                "headers": {
+                                    k: ("<redacted>" if k.lower() == "authorization" else v)
+                                    for k, v in self.headers.items()
+                                },
+                                "body": parsed_after,
+                            },
+                            handle,
+                        )
                 except Exception:
                     log.exception("failed to write %s", LAST_TOOLS_PATH)
 
-        self._forward(body)
+        self._forward(body, ctx)
 
-    def _forward(self, body: bytes) -> None:
+    def _forward(self, body: bytes, ctx: Optional[RequestContext] = None) -> None:
         scheme, host, port, tls = split_upstream(self.server.upstream_url)
         if tls:
             conn = HTTPSConnection(host, port, context=ssl.create_default_context(), timeout=600)
         else:
             conn = HTTPConnection(host, port, timeout=600)
 
+        # Header names from Codex arrive lowercase; drop every header we
+        # re-emit ourselves so the upstream never sees conflicting duplicates.
+        had_content_length = False
         headers = {}
         for key, value in self.headers.items():
-            if key.lower() in HOP_BY_HOP:
+            lowered = key.lower()
+            if lowered in HOP_BY_HOP or lowered in OVERRIDDEN_HEADERS:
+                if lowered == "content-length":
+                    had_content_length = True
                 continue
             headers[key] = value
         headers["Host"] = host if port in (80, 443) else "%s:%s" % (host, port)
         headers["Accept-Encoding"] = "identity"
         if body:
             headers["Content-Length"] = str(len(body))
-        elif "Content-Length" in headers:
+        elif had_content_length:
             headers["Content-Length"] = "0"
 
         try:
             conn.request(self.command, self.path, body=body or None, headers=headers)
             upstream = conn.getresponse()
-            self._write_upstream(upstream)
+            self._write_upstream(upstream, ctx)
         except BrokenPipeError:
             log.info("client closed the connection")
         except Exception as exc:
@@ -206,7 +240,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except Exception:
             log.exception("failed to write %s", LAST_ERROR_PATH)
 
-    def _write_upstream(self, upstream) -> None:
+    def _write_upstream(self, upstream, ctx: Optional[RequestContext] = None) -> None:
+        rewrite = ctx is not None and ctx.rewrites_responses
         if upstream.status >= 400:
             payload = upstream.read()
             self._log_upstream_error(upstream.status, payload, upstream.getheaders())
@@ -224,12 +259,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
 
         length_header = upstream.getheader("Content-Length")
+        content_type = (upstream.getheader("Content-Type") or "").lower()
+        is_sse = "text/event-stream" in content_type
+        is_json = "application/json" in content_type
         self.send_response(upstream.status, upstream.reason)
         for key, value in upstream.getheaders():
             if key.lower() in HOP_BY_HOP or key.lower() == "content-length":
                 continue
             self.send_header(key, value)
-        if length_header and self.command != "HEAD":
+
+        if rewrite and is_json and not is_sse and self.command != "HEAD":
+            # Non-streaming JSON: buffer, rewrite, re-measure.
+            payload = rewrite_json_response(upstream.read(), ctx)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return
+
+        if length_header and self.command != "HEAD" and not (rewrite and is_sse):
             self.send_header("Content-Length", length_header)
             self.send_header("Connection", "close")
             self.end_headers()
@@ -248,13 +297,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command == "HEAD":
             return
+
+        rewriter = SSERewriter(ctx) if (rewrite and is_sse) else None
+        # read1() returns as soon as any bytes are available; read() would
+        # block until 64 KB accumulate and destroy SSE streaming.
         while True:
-            chunk = upstream.read(65536)
+            chunk = upstream.read1(65536)
             if not chunk:
                 break
-            self.wfile.write(("%X\r\n" % len(chunk)).encode("ascii") + chunk + b"\r\n")
-            self.wfile.flush()
+            if rewriter is not None:
+                chunk = rewriter.feed(chunk)
+                if not chunk:
+                    continue
+            self._write_chunk(chunk)
+        if rewriter is not None:
+            tail = rewriter.flush()
+            if tail:
+                self._write_chunk(tail)
         self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+    def _write_chunk(self, chunk: bytes) -> None:
+        self.wfile.write(("%X\r\n" % len(chunk)).encode("ascii") + chunk + b"\r\n")
         self.wfile.flush()
 
 
@@ -262,8 +326,10 @@ class ProxyServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, host: str, port: int, upstream_url: str):
+    def __init__(self, host: str, port: int, upstream_url: str, capture_debug: bool = True):
         self.upstream_url = upstream_url.rstrip("/")
+        # Writes last-muse-*.json next to this file for troubleshooting.
+        self.capture_debug = capture_debug
         super().__init__((host, port), ProxyHandler)
 
 

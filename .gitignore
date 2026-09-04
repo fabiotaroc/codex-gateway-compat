@@ -1,5 +1,6 @@
 # Runtime dumps from the local proxy
 *.log
+last-muse-request.json
 last-muse-tools.json
 last-muse-tools-full.json
 last-upstream-error.json
