@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
 import json
-import sys
 import unittest
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from rewrite import (
+from proxy.rewrite import (
     FLAT_SEPARATOR,
     complete_required,
     is_muse_model,

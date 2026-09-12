@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 import json
-import sys
 import threading
 import time
 import unittest
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from proxy import ProxyServer
+from proxy.server import ProxyServer
 
 
 class UpstreamHandler(BaseHTTPRequestHandler):

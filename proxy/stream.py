@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
-from rewrite import FLAT_SEPARATOR, RequestContext
+from proxy.rewrite import FLAT_SEPARATOR, RequestContext
 
 ARGUMENT_DELTA_EVENT = "response.function_call_arguments.delta"
 ARGUMENT_DONE_EVENT = "response.function_call_arguments.done"

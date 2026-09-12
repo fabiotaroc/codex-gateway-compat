@@ -19,15 +19,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import List, Optional, Tuple
 from urllib.parse import urlsplit
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rewrite import RequestContext, rewrite_request_bytes, summarize_models, summarize_tools
-from stream import SSERewriter, rewrite_json_response
+from proxy.rewrite import RequestContext, rewrite_request_bytes, summarize_models, summarize_tools
+from proxy.stream import SSERewriter, rewrite_json_response
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18787
 DEFAULT_UPSTREAM = "https://ai-gateway.vercel.sh"
-HERE = os.path.dirname(os.path.abspath(__file__))
-VAR_DIR = os.path.join(HERE, "var")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+VAR_DIR = os.path.join(REPO_ROOT, "var")
 LAST_TOOLS_PATH = os.path.join(VAR_DIR, "last-tools.json")
 LAST_TOOLS_FULL_PATH = os.path.join(VAR_DIR, "last-tools-full.json")
 LAST_ERROR_PATH = os.path.join(VAR_DIR, "last-upstream-error.json")
