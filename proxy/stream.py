@@ -2,20 +2,29 @@
 
 Works on both Responses API SSE streams and non-streaming JSON bodies. Only
 applied when the matching request was rewritten for a non-OpenAI model.
+
+Also normalizes assistant-message `phase` and `output_item.done` order so Codex
+Desktop can collapse the "Worked for" group. Non-OpenAI gateways often omit
+`phase` and emit reasoning `.done` after the final message.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from proxy.rewrite import FLAT_SEPARATOR, RequestContext
 
 ARGUMENT_DELTA_EVENT = "response.function_call_arguments.delta"
 ARGUMENT_DONE_EVENT = "response.function_call_arguments.done"
-ITEM_EVENTS = ("response.output_item.added", "response.output_item.done")
+ITEM_ADDED_EVENT = "response.output_item.added"
+ITEM_DONE_EVENT = "response.output_item.done"
+ITEM_EVENTS = (ITEM_ADDED_EVENT, ITEM_DONE_EVENT)
 RESPONSE_EVENTS = ("response.completed", "response.incomplete", "response.failed")
 CALL_ITEM_TYPES = ("function_call", "tool_search_call", "custom_tool_call")
+COMMENTARY_PHASE = "commentary"
+FINAL_ANSWER_PHASE = "final_answer"
 
 
 def coerce_integral_floats(value: Any) -> Tuple[Any, bool]:
@@ -61,6 +70,39 @@ def coerce_arguments(arguments: Any) -> Tuple[Any, bool]:
     return arguments, False
 
 
+def is_assistant_message(item: Any) -> bool:
+    if not isinstance(item, dict) or item.get("type") != "message":
+        return False
+    return item.get("role") in (None, "assistant")
+
+
+def is_unphased_assistant_message(item: Any) -> bool:
+    return is_assistant_message(item) and not item.get("phase")
+
+
+def tag_final_assistant_in_output(items: Any) -> Any:
+    """Mark the last non-commentary assistant message as the final answer.
+
+    If that message is followed only by reasoning items, move it after them so
+    `response.output` matches the event order Codex Desktop expects.
+    """
+    if not isinstance(items, list):
+        return items
+    last = None
+    for index, item in enumerate(items):
+        if is_assistant_message(item) and item.get("phase") != COMMENTARY_PHASE:
+            last = index
+    if last is None:
+        return items
+    item = items[last]
+    if not item.get("phase"):
+        item["phase"] = FINAL_ANSWER_PHASE
+    trailing = items[last + 1 :]
+    if trailing and all(isinstance(extra, dict) and extra.get("type") == "reasoning" for extra in trailing):
+        return items[:last] + trailing + [item]
+    return items
+
+
 def unflatten_name(name: Any, ctx: RequestContext) -> Optional[Tuple[str, str]]:
     if not isinstance(name, str) or not name:
         return None
@@ -102,7 +144,9 @@ def rewrite_event(event_type: str, data: dict, ctx: RequestContext) -> List[dict
     if event_type in RESPONSE_EVENTS:
         response = data.get("response")
         if isinstance(response, dict) and isinstance(response.get("output"), list):
-            response["output"] = [rewrite_output_item(item, ctx)[0] for item in response["output"]]
+            response["output"] = tag_final_assistant_in_output(
+                [rewrite_output_item(item, ctx)[0] for item in response["output"]]
+            )
         return [data]
 
     if ctx.coerce_floats and event_type == ARGUMENT_DELTA_EVENT:
@@ -128,8 +172,71 @@ def rewrite_json_response(raw: bytes, ctx: RequestContext) -> bytes:
         return raw
     if not isinstance(body, dict) or not isinstance(body.get("output"), list):
         return raw
-    body["output"] = [rewrite_output_item(item, ctx)[0] for item in body["output"]]
+    body["output"] = tag_final_assistant_in_output(
+        [rewrite_output_item(item, ctx)[0] for item in body["output"]]
+    )
     return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+@dataclass
+class _HeldEvent:
+    event: dict
+    had_event_line: bool
+    other_lines: List[str]
+
+
+@dataclass
+class StreamState:
+    """Holds an unphased assistant `output_item.done` until we know whether
+    more work is coming or the turn is finished."""
+
+    held: Optional[_HeldEvent] = field(default=None)
+
+    def ingest(
+        self,
+        events: List[dict],
+        had_event_line: bool,
+        other_lines: List[str],
+    ) -> List[_HeldEvent]:
+        out: List[_HeldEvent] = []
+        for event in events:
+            current = _HeldEvent(event, had_event_line, other_lines)
+            event_type = str(event.get("type") or "")
+            item = event.get("item") if isinstance(event.get("item"), dict) else None
+
+            if event_type == ITEM_DONE_EVENT and is_unphased_assistant_message(item):
+                released = self._release(as_final=False)
+                if released:
+                    out.append(released)
+                self.held = current
+                continue
+
+            if event_type == ITEM_ADDED_EVENT or event_type in RESPONSE_EVENTS:
+                released = self._release(as_final=event_type in RESPONSE_EVENTS)
+                if released:
+                    out.append(released)
+            elif event_type == ITEM_DONE_EVENT and item is not None and item.get("type") != "reasoning":
+                released = self._release(as_final=False)
+                if released:
+                    out.append(released)
+
+            out.append(current)
+        return out
+
+    def flush(self) -> List[_HeldEvent]:
+        released = self._release(as_final=True)
+        return [released] if released else []
+
+    def _release(self, as_final: bool) -> Optional[_HeldEvent]:
+        held = self.held
+        self.held = None
+        if held is None:
+            return None
+        if as_final:
+            item = held.event.get("item")
+            if is_unphased_assistant_message(item):
+                item["phase"] = FINAL_ANSWER_PHASE
+        return held
 
 
 class SSERewriter:
@@ -139,6 +246,7 @@ class SSERewriter:
     def __init__(self, ctx: RequestContext):
         self.ctx = ctx
         self._buffer = b""
+        self._state = StreamState()
 
     def feed(self, chunk: bytes) -> bytes:
         self._buffer += chunk
@@ -153,13 +261,15 @@ class SSERewriter:
         return b"".join(out)
 
     def flush(self) -> bytes:
-        if not self._buffer.strip():
-            rest = self._buffer
+        parts: List[bytes] = []
+        if self._buffer.strip():
+            parts.append(self._rewrite_block(self._buffer))
             self._buffer = b""
-            return rest
-        block = self._buffer
-        self._buffer = b""
-        return self._rewrite_block(block)
+        elif self._buffer:
+            parts.append(self._buffer)
+            self._buffer = b""
+        parts.append(self._render(self._state.flush()))
+        return b"".join(parts)
 
     @staticmethod
     def _find_boundary(buffer: bytes) -> Tuple[int, int]:
@@ -198,13 +308,18 @@ class SSERewriter:
 
         resolved_type = event_type or str(payload.get("type") or "")
         events = rewrite_event(resolved_type, payload, self.ctx)
-
-        rendered: List[bytes] = []
         for event in events:
-            out_type = str(event.get("type") or resolved_type)
-            parts = [line for line in other_lines if line]
-            if event_type is not None:
+            event.setdefault("type", resolved_type)
+        return self._render(self._state.ingest(events, event_type is not None, other_lines))
+
+    @staticmethod
+    def _render(held_events: List[_HeldEvent]) -> bytes:
+        rendered: List[bytes] = []
+        for held in held_events:
+            out_type = str(held.event.get("type") or "")
+            parts = [line for line in held.other_lines if line]
+            if held.had_event_line:
                 parts.append("event: %s" % out_type)
-            parts.append("data: %s" % json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+            parts.append("data: %s" % json.dumps(held.event, ensure_ascii=False, separators=(",", ":")))
             rendered.append(("\n".join(parts) + "\n\n").encode("utf-8", errors="surrogateescape"))
         return b"".join(rendered)

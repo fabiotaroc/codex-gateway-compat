@@ -171,6 +171,91 @@ class SSERewriterTests(unittest.TestCase):
         raw = b'data: {"type":"response.output_text.delta","delta":"hi 1.0"}\n\n'
         self.assertEqual(rewriter.feed(raw), raw)
 
+    def test_holds_unphased_message_until_after_trailing_reasoning(self):
+        rewriter = SSERewriter(_ctx())
+        message = {"type": "message", "role": "assistant", "id": "m1", "content": [{"type": "output_text", "text": "hello"}]}
+        reasoning = {"type": "reasoning", "id": "r1", "summary": [{"type": "summary_text", "text": ""}]}
+        prefix = rewriter.feed(
+            b"".join(
+                [
+                    _event("response.created", {"response": {"id": "resp"}}),
+                    _event("response.output_item.added", {"output_index": 0, "item": reasoning}),
+                    _event("response.output_item.added", {"output_index": 1, "item": message}),
+                    _event("response.output_text.delta", {"delta": "hello"}),
+                    _event("response.output_item.done", {"output_index": 1, "item": message}),
+                ]
+            )
+        )
+        types = [event["type"] for event in _parse_events(prefix)]
+        self.assertEqual(
+            types,
+            [
+                "response.created",
+                "response.output_item.added",
+                "response.output_item.added",
+                "response.output_text.delta",
+            ],
+        )
+
+        mid = rewriter.feed(_event("response.output_item.done", {"output_index": 0, "item": reasoning}))
+        mid_events = _parse_events(mid)
+        self.assertEqual(len(mid_events), 1)
+        self.assertEqual(mid_events[0]["item"]["type"], "reasoning")
+
+        tail = rewriter.feed(
+            _event(
+                "response.completed",
+                {"response": {"id": "resp", "output": [reasoning, dict(message)]}},
+            )
+        )
+        tail += rewriter.flush()
+        tail_events = _parse_events(tail)
+        self.assertEqual([event["type"] for event in tail_events], ["response.output_item.done", "response.completed"])
+        self.assertEqual(tail_events[0]["item"]["type"], "message")
+        self.assertEqual(tail_events[0]["item"]["phase"], "final_answer")
+        self.assertEqual(tail_events[1]["response"]["output"][-1]["type"], "message")
+        self.assertEqual(tail_events[1]["response"]["output"][-1]["phase"], "final_answer")
+        self.assertEqual([item["type"] for item in tail_events[1]["response"]["output"]], ["reasoning", "message"])
+
+    def test_releases_unphased_message_as_commentary_when_more_work_starts(self):
+        rewriter = SSERewriter(_ctx())
+        message = {"type": "message", "role": "assistant", "id": "m1", "content": [{"type": "output_text", "text": "checking"}]}
+        call = {"type": "function_call", "name": "exec_command", "arguments": "", "call_id": "c1"}
+        out = rewriter.feed(
+            b"".join(
+                [
+                    _event("response.output_item.done", {"output_index": 0, "item": message}),
+                    _event("response.output_item.added", {"output_index": 1, "item": call}),
+                ]
+            )
+        )
+        events = _parse_events(out)
+        self.assertEqual([event["type"] for event in events], ["response.output_item.done", "response.output_item.added"])
+        self.assertNotIn("phase", events[0]["item"])
+        self.assertEqual(events[1]["item"]["type"], "function_call")
+
+    def test_commentary_messages_are_not_held(self):
+        rewriter = SSERewriter(_ctx())
+        message = {
+            "type": "message",
+            "role": "assistant",
+            "id": "m1",
+            "phase": "commentary",
+            "content": [{"type": "output_text", "text": "working"}],
+        }
+        out = rewriter.feed(_event("response.output_item.done", {"output_index": 0, "item": message}))
+        events = _parse_events(out)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["item"]["phase"], "commentary")
+
+    def test_flush_tags_held_message_when_stream_ends(self):
+        rewriter = SSERewriter(_ctx())
+        message = {"type": "message", "role": "assistant", "id": "m1", "content": [{"type": "output_text", "text": "hello"}]}
+        self.assertEqual(rewriter.feed(_event("response.output_item.done", {"output_index": 0, "item": message})), b"")
+        events = _parse_events(rewriter.flush())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["item"]["phase"], "final_answer")
+
 
 class JSONResponseTests(unittest.TestCase):
     def test_rewrites_non_streaming_output(self):
@@ -179,6 +264,18 @@ class JSONResponseTests(unittest.TestCase):
         self.assertEqual(out["output"][0]["namespace"], "mcp__codex_apps__notion")
         self.assertEqual(out["output"][0]["name"], "_fetch")
         self.assertEqual(json.loads(out["output"][0]["arguments"]), {"n": 2})
+
+    def test_tags_and_reorders_final_assistant_message(self):
+        body = {
+            "id": "r",
+            "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+                {"type": "reasoning", "id": "rs1", "summary": []},
+            ],
+        }
+        out = json.loads(rewrite_json_response(json.dumps(body).encode(), _ctx()))
+        self.assertEqual([item["type"] for item in out["output"]], ["reasoning", "message"])
+        self.assertEqual(out["output"][1]["phase"], "final_answer")
 
     def test_round_trip_through_prepare_request(self):
         body = {
