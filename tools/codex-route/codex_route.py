@@ -13,14 +13,19 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, NoReturn, Optional
+from typing import Literal, Mapping, NoReturn, Optional
 
 
 BEGIN_MARK = "# BEGIN CODEX-ROUTE"
 END_MARK = "# END CODEX-ROUTE"
-# Codex Desktop ships inside ChatGPT.app and only reads config.toml at startup.
+# Codex Desktop ships inside ChatGPT.app. It rereads config.toml while running,
+# but never revalidates the model already selected in the composer, so a switch
+# that does not restart the app can leave a slug the new provider rejects.
 CODEX_APP_BUNDLE = os.environ.get("CODEX_ROUTE_APP_BUNDLE", "com.openai.codex")
 CODEX_APP_QUIT_TIMEOUT_S = 20.0
+RESTART_FLAG_NAME = ".codex-route-restart-pending.json"
+PS_START_FORMAT = "%a %b %d %H:%M:%S %Y"
+RestartOutcome = Literal["restarted", "refused", "not-running", "skipped"]
 ROUTE_NAMES = ("vercel", "subscription")
 MANAGED_KEYS = ("model", "model_provider", "model_reasoning_effort")
 LEGACY_COMMENT_PREFIXES = (
@@ -254,7 +259,11 @@ def other_route(route: str) -> str:
     raise AssertionError(f"unhandled route: {unreachable}")
 
 
-def format_status(state: RouteState, presets: Mapping[str, Preset]) -> str:
+def format_status(
+    state: RouteState,
+    presets: Mapping[str, Preset],
+    pending_route: Optional[str] = None,
+) -> str:
     if state.route and state.route in presets:
         preset = presets[state.route]
         text = f"{preset.label}: {preset.model} via {preset.model_provider}"
@@ -268,6 +277,12 @@ def format_status(state: RouteState, presets: Mapping[str, Preset]) -> str:
         text += (
             f" — CONFLICT: duplicate {', '.join(state.conflicts)} outside the block;"
             " Codex will not start. Run `codex-route repair`."
+        )
+    if pending_route:
+        label = presets[pending_route].label if pending_route in presets else pending_route
+        text += (
+            f" — PENDING: Codex is still running from before the switch to {label};"
+            " quit and reopen it to apply the route."
         )
     return text
 
@@ -303,10 +318,34 @@ def codex_app_running() -> bool:
     return result.stdout.strip() == "true"
 
 
-def restart_codex_app() -> bool:
-    """Quit Codex Desktop gracefully and relaunch it. Returns True if restarted."""
+def codex_app_path() -> Optional[str]:
+    """Bundle path of Codex Desktop. Resolving it does not launch the app."""
+    result = _quiet_run(
+        ["osascript", "-e", f'POSIX path of (path to application id "{CODEX_APP_BUNDLE}")']
+    )
+    return result.stdout.strip() or None
+
+
+def codex_app_started_at(app_path: str) -> Optional[float]:
+    """Epoch seconds the running Codex Desktop launched, or None if it is stopped."""
+    pids = _quiet_run(["pgrep", "-f", f"{app_path}Contents/MacOS/"]).stdout.split()
+    started: list[float] = []
+    for pid in pids:
+        # ps pads single-digit days with a second space, which strptime rejects.
+        raw = " ".join(_quiet_run(["ps", "-o", "lstart=", "-p", pid]).stdout.split())
+        if not raw:
+            continue
+        try:
+            started.append(time.mktime(time.strptime(raw, PS_START_FORMAT)))
+        except ValueError:
+            continue
+    return max(started) if started else None
+
+
+def restart_codex_app() -> RestartOutcome:
+    """Quit Codex Desktop gracefully and relaunch it."""
     if not codex_app_running():
-        return False
+        return "not-running"
     _quiet_run(["osascript", "-e", f'tell application id "{CODEX_APP_BUNDLE}" to quit'])
     deadline = time.monotonic() + CODEX_APP_QUIT_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -316,16 +355,69 @@ def restart_codex_app() -> bool:
     else:
         # The app ignored the quit request (or a dialog is blocking it).
         # Leave it alone rather than killing it mid-task.
-        notify("Codex Route", "Codex did not quit; restart it to apply the new default.")
-        return False
+        return "refused"
     time.sleep(0.5)
     _quiet_run(["open", "-b", CODEX_APP_BUNDLE])
-    return True
+    return "restarted"
+
+
+def restart_flag_path(config_path: Path) -> Path:
+    return config_path.with_name(RESTART_FLAG_NAME)
+
+
+def write_restart_flag(config_path: Path, preset: Preset) -> None:
+    payload = {
+        "route": preset.name,
+        "model": preset.model,
+        "flagged_at": time.time(),
+        # Cached so reading the flag never pays for a LaunchServices lookup.
+        "app_path": codex_app_path(),
+    }
+    atomic_write(restart_flag_path(config_path), json.dumps(payload, indent=2))
+
+
+def clear_restart_flag(config_path: Path) -> None:
+    restart_flag_path(config_path).unlink(missing_ok=True)
+
+
+def pending_restart(config_path: Path) -> Optional[str]:
+    """Route whose switch never reached a running Codex, if it is still pending."""
+    path = restart_flag_path(config_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    app_path = payload.get("app_path")
+    flagged_at = payload.get("flagged_at")
+    started_at = codex_app_started_at(app_path) if isinstance(app_path, str) else None
+    relaunched = (
+        started_at is not None
+        and isinstance(flagged_at, (int, float))
+        and started_at > flagged_at
+    )
+    # Either Codex is stopped or it relaunched since the switch; both read the
+    # new config, so the flag is stale.
+    if started_at is None or relaunched:
+        path.unlink(missing_ok=True)
+        return None
+    route = payload.get("route")
+    return route if isinstance(route, str) else None
+
+
+def warn_restart_refused(label: str) -> None:
+    """Announce a route that reached config.toml but not the running Codex."""
+    notify("Codex Route", "Codex did not quit; restart it to apply the new default.")
+    print(
+        f"warning: Codex kept running, so it is still on the previous route. "
+        f"{label} applies after you quit and reopen Codex; until then the "
+        f"model picker can hold a model the active provider rejects.",
+        file=sys.stderr,
+    )
 
 
 def write_route(
     path: Path, text: str, preset: Preset, *, announce: bool, restart: bool = False
-) -> RouteState:
+) -> tuple[RouteState, RestartOutcome]:
     atomic_write(path, apply_route(text, preset))
     state = RouteState(
         route=preset.name,
@@ -344,9 +436,13 @@ def write_route(
         suffix = " · restarting Codex" if restart and codex_app_running() else ""
         notify("Codex Route", f"Default → {preset.label} ({preset.model}){suffix}")
         refresh_swiftbar()
-    if restart:
-        restart_codex_app()
-    return state
+    outcome: RestartOutcome = restart_codex_app() if restart else "skipped"
+    if outcome == "refused":
+        write_restart_flag(path, preset)
+        warn_restart_refused(preset.label)
+    elif outcome in ("restarted", "not-running"):
+        clear_restart_flag(path)
+    return state, outcome
 
 
 def resolve_target(action: str, state: RouteState) -> str:
@@ -379,11 +475,16 @@ def swiftbar_item(title: str, cli: Path, action: str, *, checked: bool = False) 
     return f'{title} | bash="{cli}" param1={action} terminal=false refresh=true{extras}'
 
 
-def swiftbar_output(state: RouteState, presets: Mapping[str, Preset], script_path: Path) -> str:
+def swiftbar_output(
+    state: RouteState,
+    presets: Mapping[str, Preset],
+    script_path: Path,
+    pending_route: Optional[str] = None,
+) -> str:
     cli = swiftbar_cli(script_path)
     label = presets[state.route].label if state.route in presets else "Codex"
     title = "Sub" if state.route == "subscription" else label
-    if state.conflicts:
+    if state.conflicts or pending_route:
         title = f"⚠︎ {title}"
     lines = [title, "---"]
     if state.conflicts:
@@ -391,6 +492,14 @@ def swiftbar_output(state: RouteState, presets: Mapping[str, Preset], script_pat
             swiftbar_item(
                 f"Repair config (duplicate {', '.join(state.conflicts)})", cli, "repair"
             )
+        )
+        lines.append("---")
+    if pending_route:
+        pending_label = (
+            presets[pending_route].label if pending_route in presets else pending_route
+        )
+        lines.append(
+            swiftbar_item(f"Restart Codex to apply {pending_label}", cli, "restart")
         )
         lines.append("---")
     for name in ROUTE_NAMES:
@@ -407,9 +516,12 @@ def build_parser() -> argparse.ArgumentParser:
         "action",
         choices=(
             "status", "toggle", "vercel", "subscription", "sub", "gateway",
-            "adopt", "repair", "swiftbar",
+            "adopt", "repair", "restart", "swiftbar",
         ),
-        help="status, adopt/repair current values, or switch the default route",
+        help=(
+            "status, adopt/repair current values, restart Codex to apply a saved "
+            "route, or switch the default route"
+        ),
     )
     parser.add_argument("--config", type=Path, help="config.toml path")
     parser.add_argument("--presets", type=Path, help="presets JSON path")
@@ -446,6 +558,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     action = normalize_action(args.action)
 
     if action == "status":
+        pending = pending_restart(config_path)
         if args.json:
             print(
                 json.dumps(
@@ -454,17 +567,35 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "managed": state.managed,
                         "keys": dict(state.keys),
                         "conflicts": list(state.conflicts),
+                        "restart_pending": pending,
                         "config": str(config_path),
                     },
                     indent=2,
                 )
             )
         else:
-            print(format_status(state, presets))
+            print(format_status(state, presets, pending))
         return 0
 
     if action == "swiftbar":
-        sys.stdout.write(swiftbar_output(state, presets, Path(__file__).resolve()))
+        sys.stdout.write(
+            swiftbar_output(
+                state, presets, Path(__file__).resolve(), pending_restart(config_path)
+            )
+        )
+        return 0
+
+    if action == "restart":
+        pending = pending_restart(config_path)
+        outcome = restart_codex_app()
+        if outcome == "refused":
+            label = presets[pending].label if pending in presets else "The saved route"
+            warn_restart_refused(label)
+            print(format_status(state, presets, pending))
+            return 1
+        clear_restart_flag(config_path)
+        refresh_swiftbar()
+        print(format_status(state, presets))
         return 0
 
     target = resolve_target(action, state)
@@ -480,9 +611,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     # (repair exists because a duplicate key stops Codex from starting).
     restart_wanted = action != "adopt"
     restart = restart_wanted and not args.no_restart and not os.environ.get("CODEX_ROUTE_NO_RESTART")
-    new_state = write_route(config_path, text, preset, announce=action != "adopt", restart=restart)
-    print(format_status(new_state, presets))
-    return 0
+    new_state, outcome = write_route(
+        config_path, text, preset, announce=action != "adopt", restart=restart
+    )
+    print(format_status(new_state, presets, preset.name if outcome == "refused" else None))
+    return 1 if outcome == "refused" else 0
 
 
 if __name__ == "__main__":

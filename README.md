@@ -143,7 +143,7 @@ To skip rewriting, switch that model to the direct provider.
 
 ## Part 2: The route toggle
 
-The provider table above tells Codex *how* to reach the gateway. Which one Codex uses by default is decided by three top-level keys in the same file: `model`, `model_provider`, and `model_reasoning_effort`. Flipping them by hand means editing `config.toml`, quitting Codex Desktop, and reopening it, because Desktop only reads the config at startup.
+The provider table above tells Codex *how* to reach the gateway. Which one Codex uses by default is decided by three top-level keys in the same file: `model`, `model_provider`, and `model_reasoning_effort`. Flipping them by hand means editing `config.toml`, quitting Codex Desktop, and reopening it. Desktop does reread the config while running, but it never revalidates the model already selected in the composer, so without a restart the picker can keep a slug the new provider rejects.
 
 `codex-route` does all of that in one step. It keeps those three keys in a marked block at the top of `~/.codex/config.toml`, rewrites the block atomically, and leaves the rest of the file untouched:
 
@@ -187,7 +187,7 @@ codex-route toggle
 
 **Menu bar (SwiftBar)**: an item reading `Vercel` or `Sub` next to the clock. Click it and pick the other route.
 
-Every switch writes the block, posts a macOS notification, asks Codex Desktop (`ChatGPT.app`) to quit gracefully, waits for it, and relaunches it. If Codex is not running it stays closed. If Codex refuses to quit within 20 seconds (a dialog is open, for example), the file is still updated and the notification tells you to restart by hand; nothing is force-killed. Use `--no-restart` to edit the file only.
+Every switch writes the block, posts a macOS notification, asks Codex Desktop (`ChatGPT.app`) to quit gracefully, waits for it, and relaunches it. If Codex is not running it stays closed. If Codex refuses to quit within 20 seconds (a dialog is open, or a turn is mid-flight), the file is still updated and nothing is force-killed — but the switch has *not* taken effect, so `codex-route` exits `1`, warns on stderr, and records a pending-restart flag. `codex-route status` reports it, and the menu-bar item shows `⚠︎` with a **Restart Codex to apply …** entry; `codex-route restart` retries the quit and relaunch without rewriting the file. Use `--no-restart` to edit the file only.
 
 After the restart, **start a new chat**. Existing threads keep the provider they were created with.
 
@@ -224,4 +224,4 @@ Successful rewrites can write `var/last-request.json`, `var/last-tools.json`, an
 - Codex Desktop updates can change the Responses wire format. This is a local shim, not a supported Codex feature. If a new release 400s, inspect `var/last-upstream-error.json` and the session rollout under `~/.codex/sessions/`.
 - The route toggle changes only the *default* for new chats. The Desktop model picker can still choose any configured model per conversation, and old threads keep their original provider.
 - Codex Desktop persists some of the same keys itself (notably `model_reasoning_effort`) by appending them below the managed block, which makes the file invalid TOML (`duplicate key`) until the toggle runs again. `codex-route status` and the menu-bar item flag this; `codex-route repair` fixes it and restarts Codex.
-- The toggle relies on Codex Desktop honoring a normal quit request. It will not kill the app; if a task is mid-flight and Codex asks for confirmation, finish or cancel that first.
+- The toggle relies on Codex Desktop honoring a normal quit request. It will not kill the app; if a task is mid-flight and Codex asks for confirmation, finish or cancel that first, then run `codex-route restart`. Until you do, Desktop keeps the model that was selected before the switch, and submitting on it fails with an error that blames your account (`not supported with your ChatGPT account`) rather than the route. `codex-route status` and the menu-bar item report this as pending.

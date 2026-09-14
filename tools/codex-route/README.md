@@ -12,11 +12,16 @@ codex-route toggle
 codex-route vercel
 codex-route subscription
 codex-route adopt
+codex-route restart
 ```
+
+`restart` quits and relaunches Codex without touching `config.toml`. Use it to apply a route that was saved while Codex was busy.
 
 `adopt` rewrites the current default into a managed block without changing the route. The first `toggle` / `vercel` / `subscription` also does that.
 
-Codex Desktop (`ChatGPT.app`) only reads `config.toml` at startup, so every switch quits it gracefully and relaunches it. If the app is not running, nothing is launched. Pass `--no-restart` (or set `CODEX_ROUTE_NO_RESTART=1`) to only edit the file. If Codex refuses to quit within 20 s (for example a dialog is open), the switch is still saved and a notification asks you to restart manually.
+Codex Desktop (`ChatGPT.app`) rereads `config.toml` while running, but it never revalidates the model already selected in the composer. After a switch the picker can therefore keep a slug the new provider rejects, and the resulting error blames your account rather than the route. Every switch quits Codex gracefully and relaunches it to avoid that. If the app is not running, nothing is launched. Pass `--no-restart` (or set `CODEX_ROUTE_NO_RESTART=1`) to only edit the file.
+
+If Codex refuses to quit within 20 s — a dialog is open, or a turn is mid-flight — the switch is still saved, but `codex-route` exits `1`, prints a warning to stderr, notifies, and records `~/.codex/.codex-route-restart-pending.json`. `status` then reports `PENDING` (`restart_pending` in `--json`), and the menu-bar item turns into `⚠︎` with a **Restart Codex to apply …** entry that runs `codex-route restart`. The flag clears itself once Codex is stopped or has relaunched since the switch, so it never reports a restart you already did.
 
 Codex Desktop also writes some of these keys itself (for example `model_reasoning_effort` when you change the effort in the UI), and it appends them to the end of the top-level section rather than updating the managed block. TOML rejects duplicate keys, so Codex then fails to start with `duplicate key`. Every write by `codex-route` removes such stray copies, `status` and the menu-bar item flag them (`⚠︎`), and `codex-route repair` cleans the file and restarts Codex. The preset value wins over whatever Codex appended.
 

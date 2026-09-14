@@ -17,6 +17,8 @@ from codex_route import (  # noqa: E402
     load_presets,
     main,
     other_route,
+    pending_restart,
+    restart_flag_path,
     swiftbar_cli,
     swiftbar_output,
 )
@@ -162,7 +164,7 @@ class CodexRouteTests(unittest.TestCase):
 
     def test_switch_restarts_app_but_adopt_does_not(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch(
-            "codex_route.restart_codex_app"
+            "codex_route.restart_codex_app", return_value="restarted"
         ) as restart, mock.patch("codex_route.codex_app_running", return_value=True):
             config = Path(tmp) / "config.toml"
             config.write_text(LEGACY_VERCEL, encoding="utf-8")
@@ -170,11 +172,137 @@ class CodexRouteTests(unittest.TestCase):
             restart.assert_not_called()
             self.assertEqual(main(["--config", str(config), "--no-notify", "subscription"]), 0)
             restart.assert_called_once()
+            self.assertFalse(restart_flag_path(config).exists())
             restart.reset_mock()
             self.assertEqual(
                 main(["--config", str(config), "--no-notify", "--no-restart", "vercel"]), 0
             )
             restart.assert_not_called()
+
+    def test_refused_restart_exits_nonzero_and_flags(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "codex_route.restart_codex_app", return_value="refused"
+        ), mock.patch("codex_route.codex_app_running", return_value=True), mock.patch(
+            "codex_route.codex_app_path", return_value="/Applications/ChatGPT.app/"
+        ):
+            config = Path(tmp) / "config.toml"
+            config.write_text(LEGACY_VERCEL, encoding="utf-8")
+            stderr = StringIO()
+            with mock.patch("sys.stderr", stderr), mock.patch("sys.stdout", StringIO()):
+                code = main(["--config", str(config), "--no-notify", "subscription"])
+            self.assertEqual(code, 1)
+            self.assertIn("warning:", stderr.getvalue())
+            self.assertIn("quit and reopen Codex", stderr.getvalue())
+            flag = json.loads(restart_flag_path(config).read_text(encoding="utf-8"))
+            self.assertEqual(flag["route"], "subscription")
+            self.assertEqual(flag["app_path"], "/Applications/ChatGPT.app/")
+            # The config itself still switched; only the running app lagged.
+            self.assertEqual(inspect_text(config.read_text(), self.presets).route, "subscription")
+
+    def test_status_reports_pending_restart_until_codex_relaunches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            config.write_text(apply_route(LEGACY_VERCEL, self.presets["subscription"]))
+            restart_flag_path(config).write_text(
+                json.dumps(
+                    {
+                        "route": "subscription",
+                        "model": "gpt-5.6-sol",
+                        "flagged_at": 1000.0,
+                        "app_path": "/Applications/ChatGPT.app/",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Codex launched before the switch, so it is still on the old route.
+            with mock.patch("codex_route.codex_app_started_at", return_value=900.0):
+                payload = json.loads(_capture_stdout(config, "status"))
+                self.assertEqual(payload["restart_pending"], "subscription")
+                state = inspect_text(config.read_text(), self.presets)
+                self.assertIn("PENDING", format_status(state, self.presets, "subscription"))
+            self.assertTrue(restart_flag_path(config).exists())
+
+            # Codex relaunched after the switch, so the flag is stale.
+            with mock.patch("codex_route.codex_app_started_at", return_value=1100.0):
+                self.assertIsNone(pending_restart(config))
+            self.assertFalse(restart_flag_path(config).exists())
+
+    def test_pending_restart_clears_when_codex_is_stopped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            config.write_text(LEGACY_VERCEL, encoding="utf-8")
+            restart_flag_path(config).write_text(
+                json.dumps({"route": "vercel", "flagged_at": 1000.0, "app_path": "/x/"}),
+                encoding="utf-8",
+            )
+            with mock.patch("codex_route.codex_app_started_at", return_value=None):
+                self.assertIsNone(pending_restart(config))
+            self.assertFalse(restart_flag_path(config).exists())
+
+    def test_swiftbar_menu_offers_restart_while_pending(self):
+        script = Path(__file__).resolve().parent.parent / "tools" / "codex-route" / "codex_route.py"
+        cli = swiftbar_cli(script)
+        state = inspect_text(apply_route(LEGACY_VERCEL, self.presets["subscription"]), self.presets)
+
+        clean = swiftbar_output(state, self.presets, script)
+        self.assertIn("Sub\n---\n", clean)
+        self.assertNotIn("param1=restart", clean)
+
+        pending = swiftbar_output(state, self.presets, script, "subscription")
+        self.assertIn("⚠︎ Sub\n---\n", pending)
+        self.assertIn(
+            f'Restart Codex to apply Subscription | bash="{cli}" param1=restart '
+            "terminal=false refresh=true",
+            pending,
+        )
+        # The route items stay usable so you can still switch away instead.
+        self.assertIn("param1=vercel", pending)
+        self.assertIn("param1=subscription", pending)
+
+    def test_restart_action_clears_flag_and_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "codex_route.restart_codex_app", return_value="restarted"
+        ) as restart, mock.patch("codex_route.codex_app_started_at", return_value=900.0):
+            config = Path(tmp) / "config.toml"
+            config.write_text(apply_route(LEGACY_VERCEL, self.presets["subscription"]))
+            restart_flag_path(config).write_text(
+                json.dumps(
+                    {"route": "subscription", "flagged_at": 1000.0, "app_path": "/x/"}
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch("sys.stdout", StringIO()):
+                code = main(["--config", str(config), "--no-notify", "restart"])
+            self.assertEqual(code, 0)
+            restart.assert_called_once()
+            self.assertFalse(restart_flag_path(config).exists())
+            # Restarting applies the saved route; it must not rewrite it.
+            self.assertEqual(inspect_text(config.read_text(), self.presets).route, "subscription")
+
+    def test_restart_action_keeps_flag_when_refused(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "codex_route.restart_codex_app", return_value="refused"
+        ), mock.patch("codex_route.codex_app_started_at", return_value=900.0):
+            config = Path(tmp) / "config.toml"
+            config.write_text(apply_route(LEGACY_VERCEL, self.presets["subscription"]))
+            restart_flag_path(config).write_text(
+                json.dumps(
+                    {"route": "subscription", "flagged_at": 1000.0, "app_path": "/x/"}
+                ),
+                encoding="utf-8",
+            )
+            stderr = StringIO()
+            with mock.patch("sys.stderr", stderr), mock.patch("sys.stdout", StringIO()):
+                code = main(["--config", str(config), "--no-notify", "restart"])
+            self.assertEqual(code, 1)
+            self.assertIn("Subscription applies after you quit", stderr.getvalue())
+            self.assertTrue(restart_flag_path(config).exists())
+
+    def test_pending_restart_is_absent_without_a_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            config.write_text(LEGACY_VERCEL, encoding="utf-8")
+            self.assertIsNone(pending_restart(config))
 
     def test_cli_toggle_and_status_on_temp_config(self):
         with tempfile.TemporaryDirectory() as tmp:
